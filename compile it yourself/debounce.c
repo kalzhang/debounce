@@ -59,7 +59,12 @@ HINSTANCE ShellExecuteA(HWND hwnd, LPCSTR lpOp, LPCSTR lpFile, LPCSTR lpParams, 
 #define LLMHF_LOWER_IL_INJECTED 0x00000002
 #endif
 
+#ifndef MSGFLT_ALLOW
+#define MSGFLT_ALLOW            1
+#endif
+
 #define WM_TRAYICON     (WM_USER + 1)
+#define IDT_TRAY_RETRY  1
 #define ID_TRAY_STATUS  1000
 #define ID_TRAY_ENABLE  1001
 #define ID_TRAY_STARTUP 1002
@@ -124,6 +129,28 @@ HICON CreateMouseIcon(DWORD bodyColor, DWORD borderColor) {
         }
     }
     return CreateIcon(NULL, 16, 16, 1, 32, andMask, (BYTE*)xorMask);
+}
+
+// Fast, non-blocking check before attempting synchronous tray IPC so WH_MOUSE_LL never stalls
+BOOL EnsureTrayIcon() {
+    HWND hTray = FindWindowA("Shell_TrayWnd", NULL);
+    if (!hTray || !FindWindowExA(hTray, NULL, "TrayNotifyWnd", NULL)) {
+        return FALSE;
+    }
+
+    typedef BOOL (WINAPI *IsHungAppWindow_t)(HWND);
+    static IsHungAppWindow_t pIsHung = NULL;
+    static BOOL bCheckedHungApi = FALSE;
+    if (!bCheckedHungApi) {
+        HMODULE hUser = GetModuleHandleA("user32.dll");
+        if (hUser) pIsHung = (IsHungAppWindow_t)GetProcAddress(hUser, "IsHungAppWindow");
+        bCheckedHungApi = TRUE;
+    }
+    if (pIsHung && pIsHung(hTray)) {
+        return FALSE;
+    }
+
+    return Shell_NotifyIconA(NIM_ADD, &g_nid) || Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
 
 void ResetDebounceState() {
@@ -219,7 +246,7 @@ void ToggleStartup() {
         }
     } else {
         // Generate temporary XML to allow running on laptop batteries, remove the 72h time limit,
-        // and run at Normal priority (4) instead of Task Scheduler's default Below Normal (7).
+        // wait 2s after logon for Explorer's tray to settle, and run at Normal priority (4).
         char tempDir[MAX_PATH];
         char xmlPath[MAX_PATH + 32];
         GetTempPathA(MAX_PATH, tempDir);
@@ -230,7 +257,7 @@ void ToggleStartup() {
             fprintf(f,
                 "<?xml version=\"1.0\"?>\n"
                 "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
-                "  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>\n"
+                "  <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>PT2S</Delay></LogonTrigger></Triggers>\n"
                 "  <Principals><Principal id=\"Author\"><RunLevel>HighestAvailable</RunLevel><LogonType>InteractiveToken</LogonType></Principal></Principals>\n"
                 "  <Settings>\n"
                 "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
@@ -420,9 +447,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     } 
+    else if (msg == WM_TIMER && wParam == IDT_TRAY_RETRY) {
+        if (EnsureTrayIcon()) {
+            KillTimer(hwnd, IDT_TRAY_RETRY);
+        }
+        return 0;
+    }
     else if (msg == g_uTaskbarRestart && g_uTaskbarRestart != 0) {
-        // Re-add tray icon if explorer.exe crashes and restarts
-        Shell_NotifyIconA(NIM_ADD, &g_nid);
+        // Re-add tray icon if explorer.exe finishes starting or restarts after a crash
+        if (EnsureTrayIcon()) {
+            KillTimer(hwnd, IDT_TRAY_RETRY);
+        } else {
+            SetTimer(hwnd, IDT_TRAY_RETRY, 2000, NULL);
+        }
         return 0;
     }
     else if (msg == WM_ENDSESSION) {
@@ -480,8 +517,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LoadConfig();
     g_bStartupEnabled = QueryStartupStatus();
 
-    // 6. Create hidden top-level window (receives TaskbarCreated broadcasts unlike HWND_MESSAGE)
+    // 6. Create hidden top-level window and allow TaskbarCreated across UIPI
     g_uTaskbarRestart = RegisterWindowMessageA("TaskbarCreated");
+    if (g_uTaskbarRestart != 0) {
+        typedef BOOL (WINAPI *ChangeWindowMessageFilter_t)(UINT, DWORD);
+        ChangeWindowMessageFilter_t pFilter = (ChangeWindowMessageFilter_t)GetProcAddress(
+            GetModuleHandleA("user32.dll"), "ChangeWindowMessageFilter");
+        if (pFilter) pFilter(g_uTaskbarRestart, MSGFLT_ALLOW);
+    }
 
     WNDCLASSA wc = {0};
     wc.lpfnWndProc   = WndProc;
@@ -495,7 +538,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_hIconActive   = CreateMouseIcon(0xFFF0F0F0, 0xFF202020);
     g_hIconInactive = CreateMouseIcon(0xFF686868, 0xFF252525);
 
-    // 8. Add System Tray icon
+    // 8. Add System Tray icon (with 2-second non-blocking retry if Explorer isn't ready yet)
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize           = sizeof(g_nid);
     g_nid.hWnd             = hwnd;
@@ -504,7 +547,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon            = g_hIconActive;
     strcpy(g_nid.szTip, "Mouse Debounce Filter (Enabled)");
-    Shell_NotifyIconA(NIM_ADD, &g_nid);
+    if (!EnsureTrayIcon()) {
+        SetTimer(hwnd, IDT_TRAY_RETRY, 2000, NULL);
+    }
 
     // 9. Install the Low-Level Mouse Hook
     g_hMouseHook = SetWindowsHookExA(WH_MOUSE_LL, LowLevelMouseProc, hInstance, 0);
