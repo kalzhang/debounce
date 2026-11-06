@@ -74,6 +74,7 @@ DWORD g_debounceMs[5]    = {45, 45, 45, 45, 45};
 DWORD g_lastDownTime[5]  = {0, 0, 0, 0, 0};
 DWORD g_lastUpTime[5]    = {0, 0, 0, 0, 0};
 BOOL  g_blockNextUp[5]   = {FALSE, FALSE, FALSE, FALSE, FALSE};
+BOOL  g_isDown[5]        = {FALSE, FALSE, FALSE, FALSE, FALSE};
 
 HHOOK g_hMouseHook       = NULL;
 HICON g_hIconActive      = NULL;
@@ -129,6 +130,7 @@ void ResetDebounceState() {
     ZeroMemory(g_lastDownTime, sizeof(g_lastDownTime));
     ZeroMemory(g_lastUpTime, sizeof(g_lastUpTime));
     ZeroMemory(g_blockNextUp, sizeof(g_blockNextUp));
+    ZeroMemory(g_isDown, sizeof(g_isDown));
 }
 
 // Save lifetime blocked count to config.ini only when it has changed
@@ -263,7 +265,7 @@ void LoadConfig() {
         FILE *f = fopen(g_iniPath, "w");
         if (f) {
             fprintf(f, "[DebounceMs]\n");
-            fprintf(f, "; Time in milliseconds to block rapid duplicate clicks (Set to 0 to disable a button)\n");
+            fprintf(f, "; Time in milliseconds to block rapid duplicate clicks (0 to disable, max 500)\n");
             fprintf(f, "Left=45\n");
             fprintf(f, "Right=45\n");
             fprintf(f, "Middle=45\n");
@@ -274,11 +276,14 @@ void LoadConfig() {
             fclose(f);
         }
     }
-    g_debounceMs[0]    = GetPrivateProfileIntA("DebounceMs", "Left",   45, g_iniPath);
-    g_debounceMs[1]    = GetPrivateProfileIntA("DebounceMs", "Right",  45, g_iniPath);
-    g_debounceMs[2]    = GetPrivateProfileIntA("DebounceMs", "Middle", 45, g_iniPath);
-    g_debounceMs[3]    = GetPrivateProfileIntA("DebounceMs", "Mouse4", 45, g_iniPath);
-    g_debounceMs[4]    = GetPrivateProfileIntA("DebounceMs", "Mouse5", 45, g_iniPath);
+
+    // Load and clamp values between 0 and 500ms to prevent accidental lockout from negative/huge values
+    static const char *keys[5] = {"Left", "Right", "Middle", "Mouse4", "Mouse5"};
+    for (int i = 0; i < 5; i++) {
+        int val = GetPrivateProfileIntA("DebounceMs", keys[i], 45, g_iniPath);
+        g_debounceMs[i] = (val < 0) ? 0 : (val > 500 ? 500 : (DWORD)val);
+    }
+
     g_baseTotalBlocked = GetPrivateProfileIntA("Stats", "TotalBlocked", 0, g_iniPath);
     g_savedSession     = g_sessionBlocked;
     ResetDebounceState();
@@ -307,13 +312,14 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             case WM_MBUTTONDOWN: btn = 2; isDown = TRUE; break;
             case WM_MBUTTONUP:   btn = 2; isUp   = TRUE; break;
             case WM_XBUTTONDOWN:
-                btn = (HIWORD(pMouse->mouseData) == XBUTTON1) ? 3 : 4;
-                isDown = TRUE;
+            case WM_XBUTTONUP: {
+                WORD xBtn = HIWORD(pMouse->mouseData);
+                if (xBtn == XBUTTON1)      btn = 3;
+                else if (xBtn == XBUTTON2) btn = 4;
+                if (wParam == WM_XBUTTONDOWN) isDown = TRUE;
+                else                          isUp   = TRUE;
                 break;
-            case WM_XBUTTONUP:
-                btn = (HIWORD(pMouse->mouseData) == XBUTTON1) ? 3 : 4;
-                isUp = TRUE;
-                break;
+            }
         }
 
         if (btn != -1 && g_debounceMs[btn] > 0) {
@@ -327,20 +333,26 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 // Block if too close to previous press OR too close to previous release
                 if ((g_lastDownTime[btn] != 0 && sinceDown < g_debounceMs[btn]) ||
                     (g_lastUpTime[btn]   != 0 && sinceUp   < g_debounceMs[btn])) {
-                    g_blockNextUp[btn] = TRUE;
+                    g_lastDownTime[btn] = now; // Reset down timer on chatter
+                    // Only swallow the next UP if the button isn't already logically held down
+                    if (!g_isDown[btn]) {
+                        g_blockNextUp[btn] = TRUE;
+                    }
                     g_sessionBlocked++;
                     return 1;
                 }
                 g_lastDownTime[btn] = now;
                 g_blockNextUp[btn]  = FALSE;
+                g_isDown[btn]       = TRUE;
             } 
             else if (isUp) {
+                g_lastUpTime[btn] = now; // Always record when the physical contact opened
                 if (g_blockNextUp[btn]) {
                     // Swallow the corresponding UP event of the blocked click
                     g_blockNextUp[btn] = FALSE;
                     return 1;
                 }
-                g_lastUpTime[btn] = now;
+                g_isDown[btn] = FALSE;
             }
         }
     }
